@@ -76,6 +76,8 @@ complete -c $GO_TASK_PROGNAME -s n -l dry                       -d 'compile and 
 complete -c $GO_TASK_PROGNAME -s x -l exit-code                 -d 'pass-through exit code of task command'
 complete -c $GO_TASK_PROGNAME      -l experiments               -d 'list available experiments'
 complete -c $GO_TASK_PROGNAME -s F -l failfast                  -d 'when running tasks in parallel, stop all tasks if one fails'
+complete -c $GO_TASK_PROGNAME      -l breakpoint                -d 'bind completed tasks to a verifiable checkpoint for --resume'
+complete -c $GO_TASK_PROGNAME      -l resume                    -d 'resume a previous --breakpoint run from completed tasks'
 complete -c $GO_TASK_PROGNAME -s f -l force                     -d 'force execution even when up-to-date'
 complete -c $GO_TASK_PROGNAME -s g -l global                    -d 'run global Taskfile from home directory'
 complete -c $GO_TASK_PROGNAME -s h -l help                      -d 'show help'

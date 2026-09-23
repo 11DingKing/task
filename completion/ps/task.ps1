@@ -25,6 +25,8 @@ Register-ArgumentCompleter -CommandName $cmdNames -ScriptBlock {
 			[CompletionResult]::new('--experiments', '--experiments', [CompletionResultType]::ParameterName, 'list experiments'),
 			[CompletionResult]::new('-F', '-F', [CompletionResultType]::ParameterName, 'fail fast on pallalel tasks'),
 			[CompletionResult]::new('--failfast', '--failfast', [CompletionResultType]::ParameterName, 'force execution'),
+			[CompletionResult]::new('--breakpoint', '--breakpoint', [CompletionResultType]::ParameterName, 'bind tasks to a resumable checkpoint'),
+			[CompletionResult]::new('--resume', '--resume', [CompletionResultType]::ParameterName, 'resume a checkpointed run'),
 			[CompletionResult]::new('-f', '-f', [CompletionResultType]::ParameterName, 'force execution'),
 			[CompletionResult]::new('--force', '--force', [CompletionResultType]::ParameterName, 'force execution'),
 			[CompletionResult]::new('-g', '-g', [CompletionResultType]::ParameterName, 'run global Taskfile'),

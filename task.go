@@ -13,6 +13,7 @@ import (
 	"mvdan.cc/sh/v3/interp"
 
 	"github.com/go-task/task/v3/errors"
+	"github.com/go-task/task/v3/internal/checkpoint"
 	"github.com/go-task/task/v3/internal/env"
 	"github.com/go-task/task/v3/internal/execext"
 	"github.com/go-task/task/v3/internal/logger"
@@ -83,6 +84,12 @@ func (e *Executor) Run(ctx context.Context, calls ...*Call) error {
 		return err
 	}
 
+	var cp *checkpoint.Manager
+	if e.checkpointEnabled() && len(watchCalls) == 0 {
+		cp = e.setupCheckpoint(regularCalls)
+		e.checkpoint = cp
+	}
+
 	g := &errgroup.Group{}
 	if e.Failfast {
 		g, ctx = errgroup.WithContext(ctx)
@@ -92,11 +99,14 @@ func (e *Executor) Run(ctx context.Context, calls ...*Call) error {
 			g.Go(func() error { return e.RunTask(ctx, c) })
 		} else {
 			if err := e.RunTask(ctx, c); err != nil {
-				return err
+				return e.runFinished(cp, err)
 			}
 		}
 	}
 	if err := g.Wait(); err != nil {
+		return e.runFinished(cp, err)
+	}
+	if err := e.runFinished(cp, nil); err != nil {
 		return err
 	}
 
@@ -104,6 +114,29 @@ func (e *Executor) Run(ctx context.Context, calls ...*Call) error {
 		return e.watchTasks(watchCalls...)
 	}
 
+	return nil
+}
+
+// runFinished finalizes a run that used a checkpoint. A run stopped at a
+// checkpoint ends successfully: its progress has been persisted and the user
+// is expected to continue with resume. A failed run keeps the checkpoint so
+// its failed, interrupted and cancelled nodes can be re-executed on resume. A
+// fully successful run discards the checkpoint, as it has no further reuse.
+func (e *Executor) runFinished(cp *checkpoint.Manager, runErr error) error {
+	if cp == nil {
+		return runErr
+	}
+	if runErr != nil {
+		if cp.Interrupted() {
+			e.Logger.Outf(logger.Yellow,
+				"task: run stopped at checkpoint; run again with --resume to continue from the completed tasks\n")
+			return nil
+		}
+		return runErr
+	}
+	if err := cp.Discard(); err != nil {
+		e.Logger.VerboseErrf(logger.Yellow, "task: unable to remove checkpoint: %v\n", err)
+	}
 	return nil
 }
 
@@ -125,6 +158,15 @@ func (e *Executor) splitRegularAndWatchCalls(calls ...*Call) (regularCalls []*Ca
 
 // RunTask runs a task by its name
 func (e *Executor) RunTask(ctx context.Context, call *Call) error {
+	_, err := e.runTask(ctx, call)
+	return err
+}
+
+// runTask compiles the task call and runs its node. The returned bool reports
+// whether the node was skipped (up-to-date, restored from a checkpoint, or not
+// applicable to the current run), so callers can tell whether a dependency
+// actually executed.
+func (e *Executor) runTask(ctx context.Context, call *Call) (bool, error) {
 	// Inject prompted vars into call if available
 	if e.promptedVars != nil {
 		if call.Vars == nil {
@@ -140,24 +182,24 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) error {
 
 	t, err := e.FastCompiledTask(call)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !shouldRunOnCurrentPlatform(t.Platforms) {
 		e.Logger.VerboseOutf(logger.Yellow, `task: %q not for current platform - ignored\n`, call.Task)
-		return nil
+		return true, nil
 	}
 
 	// Check required vars early (before template compilation) if we can't prompt.
 	// This gives a clear "missing required variables" error instead of a template error.
 	if !e.canPrompt() {
 		if err := e.areTaskRequiredVarsSet(t); err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	t, err = e.CompiledTask(call)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// Check if condition after CompiledTask so dynamic variables are resolved
@@ -168,33 +210,33 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) error {
 			Env:     env.Get(t),
 		}); err != nil {
 			e.Logger.VerboseOutf(logger.Yellow, "task: if condition not met - skipped: %q\n", call.Task)
-			return nil
+			return true, nil
 		}
 	}
 
 	// Prompt for missing required vars after if check (avoid prompting if task won't run)
 	prompted, err := e.promptTaskVars(t, call)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if prompted {
 		// Recompile with the new vars
 		t, err = e.FastCompiledTask(call)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	if err := e.areTaskRequiredVarsSet(t); err != nil {
-		return err
+		return false, err
 	}
 
 	if err := e.areTaskRequiredVarsAllowedValuesSet(t); err != nil {
-		return err
+		return false, err
 	}
 
 	if !e.Watch && atomic.AddInt32(e.taskCallCount[t.Task], 1) >= MaximumTaskCall {
-		return &errors.TaskCalledTooManyTimesError{
+		return false, &errors.TaskCalledTooManyTimesError{
 			TaskName:        t.Task,
 			MaximumTaskCall: MaximumTaskCall,
 		}
@@ -203,13 +245,71 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) error {
 	release := e.acquireConcurrencyLimit()
 	defer release()
 
-	if err = e.startExecution(ctx, t, func(ctx context.Context) error {
+	restored, err := e.runNode(ctx, t, call)
+	if err != nil {
+		return false, &errors.TaskRunError{TaskName: t.Name(), Err: err}
+	}
+	return restored, nil
+}
+
+// runNode executes one graph node (a single compiled task invocation) and
+// reports whether it was restored from the checkpoint instead of executing.
+// Only the caller that actually runs the node (the "leader") records its
+// outcome; callers joined onto a duplicate execution share that outcome.
+func (e *Executor) runNode(ctx context.Context, t *ast.Task, call *Call) (bool, error) {
+	cp := e.checkpoint
+
+	var nodeKey string
+	if cp != nil {
+		key, err := checkpoint.DefHash(t)
+		if err != nil {
+			return false, err
+		}
+		nodeKey = key
+		// Record this invocation on the enclosing node's command-subtask
+		// recorder (dependency calls run without a recorder).
+		if recorder := subtaskRecorderFromContext(ctx); recorder != nil {
+			recorder.add(nodeKey)
+		}
+	}
+
+	var subtasks *subtaskRecorder
+	// restored is set by the execution closure on this caller's behalf.
+	restored := false
+	leader, joinedRestored, err := e.startExecution(ctx, t, func(ctx context.Context) error {
 		e.Logger.VerboseErrf(logger.Magenta, "task: %q started\n", call.Task)
-		if err := e.runDeps(ctx, t); err != nil {
+
+		bodyCtx := ctx
+		if cp != nil {
+			bodyCtx, subtasks = withSubtaskRecorder(ctx)
+		}
+
+		depsReran, err := e.runDeps(withoutSubtaskRecorder(bodyCtx), t)
+		if err != nil {
 			return err
 		}
 
+		// Resume: skip the node only when it is still consistent with the
+		// checkpoint and none of its dependencies had to be re-executed.
+		// --force/--force-all opts out of restore just as it opts out of the
+		// up-to-date check below.
+		if cp != nil && !(e.ForceAll || (!call.Indirect && e.Force)) {
+			seen := make(map[string]bool)
+			if e.cpRestorable(t, nodeKey, depsReran, seen) {
+				restored = true
+				if e.Verbose || (!call.Silent && !t.IsSilent() && !e.Taskfile.Silent && !e.Silent) {
+					name := t.Name()
+					if e.OutputStyle.Name == "prefixed" {
+						name = t.Prefix
+					}
+					e.Logger.Errf(logger.Magenta, "task: Task %q restored from checkpoint\n", name)
+				}
+				return nil
+			}
+		}
+
 		skipFingerprinting := e.ForceAll || (!call.Indirect && e.Force)
+		ctx = bodyCtx
 		if !skipFingerprinting {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -233,6 +333,10 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) error {
 					}
 					e.Logger.Errf(logger.Magenta, "task: Task %q is up to date\n", name)
 				}
+				// Nothing was executed in this run, so the node must not be
+				// recorded as newly completed; its dependents did not have
+				// to wait for a re-execution either.
+				restored = true
 				return nil
 			}
 		}
@@ -257,7 +361,10 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) error {
 
 		for i := range t.Cmds {
 			if t.Cmds[i].Defer {
-				defer e.runDeferred(t, call, i, t.Vars, &deferredExitCode)
+				// ctx carries the node's subtask recorder; runDeferred keeps
+				// its values while detaching from cancellation so teardown is
+				// not cut short by the interruption that triggered it.
+				defer e.runDeferred(ctx, t, call, i, t.Vars, &deferredExitCode)
 				continue
 			}
 
@@ -284,11 +391,47 @@ func (e *Executor) RunTask(ctx context.Context, call *Call) error {
 		}
 		e.Logger.VerboseErrf(logger.Magenta, "task: %q finished\n", call.Task)
 		return nil
-	}); err != nil {
-		return &errors.TaskRunError{TaskName: t.Name(), Err: err}
+	})
+	if !leader {
+		// Callers joined onto a duplicate execution share its outcome; the
+		// leader is responsible for recording the checkpoint.
+		restored = joinedRestored
 	}
-
-	return nil
+	if err != nil {
+		if cp != nil && leader {
+			if recErr := cp.Record(nodeKey, e.classifyNodeOutcome(ctx, err)); recErr != nil {
+				e.Logger.VerboseErrf(logger.Yellow, "task: unable to persist checkpoint: %v\n", recErr)
+			}
+		}
+		return false, err
+	}
+	if cp != nil && leader && !restored {
+		// Task commands and deferred commands have both finished. The node is
+		// only recorded once the declared outputs exist and its status check
+		// passes, so a later resume never skips a half-finished node.
+		if err := e.verifyCheckpointCompletion(ctx, t); err != nil {
+			if recErr := cp.Record(nodeKey, e.classifyNodeOutcome(ctx, err)); recErr != nil {
+				e.Logger.VerboseErrf(logger.Yellow, "task: unable to persist checkpoint: %v\n", recErr)
+			}
+			return false, err
+		}
+		var subKeys []string
+		if subtasks != nil {
+			subKeys = subtasks.keys()
+		}
+		sources, srcErr := cp.SourcesHash(t)
+		if srcErr != nil {
+			// Unknown source identity means the record cannot be verified
+			// later; do not block the run, but leave the node unrecorded so
+			// a resume re-executes it.
+			e.Logger.VerboseErrf(logger.Yellow, "task: cannot bind sources to checkpoint for %q: %v\n", t.Name(), srcErr)
+			return restored, nil
+		}
+		if err := cp.Completed(nodeKey, sources, subKeys); err != nil {
+			e.Logger.VerboseErrf(logger.Yellow, "task: unable to persist checkpoint: %v\n", err)
+		}
+	}
+	return restored, nil
 }
 
 func (e *Executor) mkdir(t *ast.Task) error {
@@ -308,7 +451,11 @@ func (e *Executor) mkdir(t *ast.Task) error {
 	return nil
 }
 
-func (e *Executor) runDeps(ctx context.Context, t *ast.Task) error {
+// runDeps runs the dependencies of a task. It also reports whether any of
+// them actually executed in this run (as opposed to being up-to-date or
+// restored from a checkpoint); a re-executed dependency invalidates the
+// current node for checkpoint restore.
+func (e *Executor) runDeps(ctx context.Context, t *ast.Task) (bool, error) {
 	g := &errgroup.Group{}
 	if e.Failfast || t.Failfast {
 		g, ctx = errgroup.WithContext(ctx)
@@ -316,6 +463,8 @@ func (e *Executor) runDeps(ctx context.Context, t *ast.Task) error {
 
 	reacquire := e.releaseConcurrencyLimit()
 	defer reacquire()
+
+	var reexecuted atomic.Bool
 
 	for _, d := range t.Deps {
 		g.Go(func() error {
@@ -328,19 +477,28 @@ func (e *Executor) runDeps(ctx context.Context, t *ast.Task) error {
 				defer cancel()
 			}
 
-			err := e.RunTask(depCtx, &Call{Task: d.Task, Vars: d.Vars, Silent: d.Silent, Indirect: true})
+			restored, err := e.runTask(depCtx, &Call{Task: d.Task, Vars: d.Vars, Silent: d.Silent, Indirect: true})
 			if err != nil && timedOut(depCtx, timeout) {
 				return timeout
+			}
+			if err == nil && !restored {
+				reexecuted.Store(true)
 			}
 			return err
 		})
 	}
 
-	return g.Wait()
+	// Wait first: reading the flag in the same return expression would
+	// evaluate it before g.Wait has joined the dependency goroutines.
+	err := g.Wait()
+	return reexecuted.Load(), err
 }
 
-func (e *Executor) runDeferred(t *ast.Task, call *Call, i int, vars *ast.Vars, deferredExitCode *uint8) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (e *Executor) runDeferred(parent context.Context, t *ast.Task, call *Call, i int, vars *ast.Vars, deferredExitCode *uint8) {
+	// Teardown keeps running even when the run was interrupted: start from a
+	// context that inherits parent's values (e.g. the subtask recorder) but
+	// none of its cancellation.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
 	defer cancel()
 
 	cmd := t.Cmds[i]
@@ -474,18 +632,26 @@ func timedOut(ctx context.Context, timeout *errors.TaskTimeoutError) bool {
 // executionState is the outcome of a task execution, shared with the callers
 // that join it. err is written before done is closed; read it only once closed.
 type executionState struct {
-	done chan struct{}
-	err  error
+	done     chan struct{}
+	err      error
+	restored bool
 }
 
-func (e *Executor) startExecution(ctx context.Context, t *ast.Task, execute func(ctx context.Context) error) error {
+// startExecution deduplicates concurrent executions of the same task. It
+// reports whether this caller was the leader that ran the task and whether
+// the execution was skipped (up-to-date or restored from a checkpoint).
+func (e *Executor) startExecution(
+	ctx context.Context,
+	t *ast.Task,
+	execute func(ctx context.Context) error,
+) (leader bool, restored bool, err error) {
 	h, err := e.GetHash(t)
 	if err != nil {
-		return err
+		return false, false, err
 	}
 
 	if h == "" || t.Watch {
-		return execute(ctx)
+		return true, restored, execute(ctx)
 	}
 
 	e.executionHashesMutex.Lock()
@@ -502,7 +668,7 @@ func (e *Executor) startExecution(ctx context.Context, t *ast.Task, execute func
 		// nothing left to wait for, and select would otherwise pick at random.
 		select {
 		case <-other.done:
-			return other.err
+			return false, other.restored, other.err
 		default:
 		}
 
@@ -510,11 +676,11 @@ func (e *Executor) startExecution(ctx context.Context, t *ast.Task, execute func
 		case <-other.done:
 			// Its outcome is ours. Returning nil would hide an execution that
 			// failed, or that another caller's timeout killed.
-			return other.err
+			return false, other.restored, other.err
 		case <-ctx.Done():
 			// We did not start it, so we can only stop waiting. Report the cause
 			// so that our own timeout surfaces as one.
-			return context.Cause(ctx)
+			return false, false, context.Cause(ctx)
 		}
 	}
 
@@ -524,7 +690,8 @@ func (e *Executor) startExecution(ctx context.Context, t *ast.Task, execute func
 
 	defer close(state.done)
 	state.err = execute(ctx)
-	return state.err
+	state.restored = restored
+	return true, restored, state.err
 }
 
 // FindMatchingTasks returns a list of tasks that match the given call. A task

@@ -175,6 +175,10 @@ func run() error {
 	// Merge CLI variables first (e.g. FOO=bar) so they take priority over Taskfile defaults
 	e.Taskfile.Vars.Merge(globals, nil)
 
+	// Bind the raw CLI variables to the run identity so a checkpoint created
+	// with one set of variables is never resumed with another.
+	e.Options(task.WithInvocationVars(globals.ToCacheMap()))
+
 	// Then ReverseMerge special variables so they're available for templating
 	cliArgsPostDashQuoted, err := args.ToQuotedString(cliArgsPostDash)
 	if err != nil {
@@ -189,11 +193,10 @@ func run() error {
 	specialVars.Set("CLI_OFFLINE", ast.Var{Value: flags.Offline})
 	specialVars.Set("CLI_ASSUME_YES", ast.Var{Value: flags.AssumeYes})
 	e.Taskfile.Vars.ReverseMerge(specialVars, nil)
-	if !flags.Watch {
-		e.InterceptInterruptSignals()
-	}
-
 	ctx := context.Background()
+	if !flags.Watch {
+		ctx = e.InterceptInterruptSignals(ctx)
+	}
 
 	if flags.Status {
 		return e.Status(ctx, calls...)

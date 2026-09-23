@@ -4,11 +4,13 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/sajari/fuzzy"
 
+	"github.com/go-task/task/v3/internal/checkpoint"
 	"github.com/go-task/task/v3/internal/fingerprint"
 	"github.com/go-task/task/v3/internal/logger"
 	"github.com/go-task/task/v3/internal/output"
@@ -58,6 +60,12 @@ type (
 		Concurrency         int
 		Interval            time.Duration
 		Failfast            bool
+		Breakpoint          bool
+		Resume              bool
+
+		// InvocationVars are the variables passed on the command line (global
+		// vars). They are part of the identity bound to a checkpoint.
+		InvocationVars map[string]any
 
 		// I/O
 		Stdin  io.Reader
@@ -84,6 +92,12 @@ type (
 		executionHashes      map[string]*executionState
 		executionHashesMutex sync.Mutex
 		watchedDirs          *xsync.Map[string, bool]
+
+		// checkpoint is the run's checkpoint manager. It is only set when
+		// breakpoint mode is explicitly enabled and is nil otherwise, so
+		// existing executions behave exactly as before.
+		checkpoint  *checkpoint.Manager
+		interrupted atomic.Bool
 	}
 	TempDir struct {
 		Remote      string
@@ -662,4 +676,48 @@ type failfastOption struct {
 
 func (o *failfastOption) ApplyToExecutor(e *Executor) {
 	e.Failfast = o.failfast
+}
+
+// WithBreakpoint enables breakpoint mode: completed nodes are bound to a
+// verifiable checkpoint while the run progresses, so a later run with resume
+// enabled can continue from them after an explicit stop.
+func WithBreakpoint(breakpoint bool) ExecutorOption {
+	return &breakpointOption{breakpoint}
+}
+
+type breakpointOption struct {
+	breakpoint bool
+}
+
+func (o *breakpointOption) ApplyToExecutor(e *Executor) {
+	e.Breakpoint = o.breakpoint
+}
+
+// WithResume tells the [Executor] to continue a previous breakpoint run from
+// the completed nodes recorded in its checkpoint. Unverifiable checkpoints
+// are ignored and the run starts from scratch.
+func WithResume(resume bool) ExecutorOption {
+	return &resumeOption{resume}
+}
+
+type resumeOption struct {
+	resume bool
+}
+
+func (o *resumeOption) ApplyToExecutor(e *Executor) {
+	e.Resume = o.resume
+}
+
+// WithInvocationVars binds the variables passed on the command line to the
+// run's checkpoint identity.
+func WithInvocationVars(vars map[string]any) ExecutorOption {
+	return &invocationVarsOption{vars}
+}
+
+type invocationVarsOption struct {
+	vars map[string]any
+}
+
+func (o *invocationVarsOption) ApplyToExecutor(e *Executor) {
+	e.InvocationVars = o.vars
 }

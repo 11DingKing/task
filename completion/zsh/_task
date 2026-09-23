@@ -92,6 +92,8 @@ _task() {
         '(-C --concurrency)'{-C,--concurrency}'[limit number of concurrent tasks]: '
         '(-p --parallel)'{-p,--parallel}'[run command-line tasks in parallel]'
         '(-F --failfast)'{-F,--failfast}'[when running tasks in parallel, stop all tasks if one fails]'
+        '(--breakpoint)--breakpoint[bind completed tasks to a verifiable checkpoint for --resume]'
+        '(--resume)--resume[resume a previous --breakpoint run from completed tasks]'
         '(-f --force)'{-f,--force}'[run even if task is up-to-date]'
         '(-c --color)'{-c,--color}'[colored output]'
         '(--completion)--completion[generate shell completion script]:shell:(bash zsh fish powershell nu)'

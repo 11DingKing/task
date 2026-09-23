@@ -75,6 +75,8 @@ var (
 	Color               bool
 	Interval            time.Duration
 	Failfast            bool
+	Breakpoint          bool
+	Resume              bool
 	Global              bool
 	Experiments         bool
 	Download            bool
@@ -155,6 +157,8 @@ func init() {
 	pflag.IntVarP(&Concurrency, "concurrency", "C", getConfig(config, "CONCURRENCY", func() *int { return config.Concurrency }, 0), "Limit number of tasks to run concurrently.")
 	pflag.DurationVarP(&Interval, "interval", "I", 0, "Interval to watch for changes.")
 	pflag.BoolVarP(&Failfast, "failfast", "F", getConfig(config, "FAILFAST", func() *bool { return &config.Failfast }, false), "When running tasks in parallel, stop all tasks if one fails.")
+	pflag.BoolVar(&Breakpoint, "breakpoint", false, "Enables breakpoint mode: bind completed tasks to a verifiable checkpoint so an interrupted run can be continued with --resume.")
+	pflag.BoolVar(&Resume, "resume", false, "Resume a previous --breakpoint run from its still-valid completed tasks instead of running the whole graph again.")
 	pflag.BoolVarP(&Global, "global", "g", false, "Runs global Taskfile, from $HOME/{T,t}askfile.{yml,yaml}.")
 	pflag.BoolVar(&Experiments, "experiments", false, "Lists all the available experiments and whether or not they are enabled.")
 	pflag.BoolVar(&Download, "download", false, "Forces task to download remote Taskfiles and ignore any cached versions.")
@@ -250,6 +254,10 @@ func Validate() error {
 		return errors.New("task: --cert and --cert-key must be provided together")
 	}
 
+	if (Breakpoint || Resume) && Watch {
+		return errors.New("task: --breakpoint and --resume cannot be used with --watch")
+	}
+
 	return nil
 }
 
@@ -312,6 +320,8 @@ func (o *flagsOption) ApplyToExecutor(e *task.Executor) {
 		task.WithTaskSorter(sorter),
 		task.WithVersionCheck(true),
 		task.WithFailfast(Failfast),
+		task.WithBreakpoint(Breakpoint),
+		task.WithResume(Resume),
 		task.WithTempDirPath(TempDir),
 	)
 }

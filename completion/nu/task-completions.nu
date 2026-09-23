@@ -150,6 +150,8 @@ export extern "task" [
   --parallel(-p)                                  # run the tasks given on the command line in parallel
   --concurrency(-C): int                          # limit the number of tasks run concurrently
   --failfast(-F)                                  # when running in parallel, stop everything if one task fails
+  --breakpoint                                    # bind completed tasks to a verifiable checkpoint for --resume
+  --resume                                        # resume a previous --breakpoint run from completed tasks
   --exit-code(-x)                                 # pass through the exit code of the task command
   --interactive                                   # prompt for missing required variables
   --yes(-y)                                       # assume "yes" as the answer to all prompts
