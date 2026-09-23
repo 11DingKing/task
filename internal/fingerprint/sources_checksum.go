@@ -101,8 +101,12 @@ func (c *ChecksumChecker) checksum(t *ast.Task) (string, error) {
 	h := xxh3.New()
 	buf := make([]byte, 128*1024)
 	for _, f := range sources {
-		// also sum the filename, so checksum changes for renaming a file
-		if _, err := io.CopyBuffer(h, strings.NewReader(filepath.Base(f)), buf); err != nil {
+		// Hash the file's identity (its path relative to the task directory)
+		// in addition to its contents, and separate the two with NUL bytes.
+		// That way adding, deleting, renaming or moving a source changes the
+		// checksum even when basenames or contents coincide, so a changed file
+		// set always invalidates the cached result.
+		if _, err := io.WriteString(h, "\x00"+sourceName(t.Dir, f)+"\x00"); err != nil {
 			return "", err
 		}
 		file, err := os.Open(f)
@@ -117,10 +121,25 @@ func (c *ChecksumChecker) checksum(t *ast.Task) (string, error) {
 			return "", err
 		}
 		file.Close()
+		if _, err := io.WriteString(h, "\x00"); err != nil {
+			return "", err
+		}
 	}
 
 	hash := h.Sum128()
 	return fmt.Sprintf("%x%x", hash.Hi, hash.Lo), nil
+}
+
+// sourceName identifies a source independently of where the task directory
+// lives, so the checksum survives moving a checkout but still changes when the
+// file moves within it. Slash-normalized because glob results use forward
+// slashes on every platform.
+func sourceName(dir, f string) string {
+	rel, err := filepath.Rel(filepath.FromSlash(dir), filepath.FromSlash(f))
+	if err != nil {
+		return filepath.ToSlash(f)
+	}
+	return filepath.ToSlash(rel)
 }
 
 func (checker *ChecksumChecker) checksumFilePath(t *ast.Task) string {

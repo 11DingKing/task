@@ -137,6 +137,10 @@ func ExpandFields(s string) ([]string, error) {
 		Env:      expand.FuncEnviron(os.Getenv),
 		ReadDir2: os.ReadDir,
 		GlobStar: true,
+		// DotGlob makes the shell-based fallback match hidden files and files
+		// below hidden directories, like the optimized recursive glob does, so
+		// every source pattern resolves to the same files on disk.
+		DotGlob:  true,
 		NullGlob: true,
 	}
 	return expand.Fields(cfg, words...)
