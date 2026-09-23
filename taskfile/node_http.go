@@ -119,14 +119,18 @@ func (node *HTTPNode) ReadContext(ctx context.Context) ([]byte, error) {
 		return nil, errors.TaskfileFetchFailedError{URI: node.Location()}
 	}
 
-	resp, err := client.Do(req.WithContext(ctx))
+	resp, err := client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, err
 		}
 		return nil, errors.TaskfileFetchFailedError{URI: node.Location()}
 	}
-	defer resp.Body.Close()
+	// The response body owns the underlying connection. Closing it on every
+	// return path guarantees an abnormal status or an interrupted read cannot
+	// leak a half-open connection into a retry, which always issues a fresh
+	// request.
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, errors.TaskfileFetchFailedError{
 			URI:            node.Location(),
@@ -134,10 +138,16 @@ func (node *HTTPNode) ReadContext(ctx context.Context) ([]byte, error) {
 		}
 	}
 
-	// Read the entire response body
+	// Buffer the entire response before returning. The caller only commits the
+	// bytes to the cache after this succeeds, so an interrupted read produces
+	// no cacheable content: the deferred close releases the connection and the
+	// next run re-requests the file.
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("reading response from %q: %w", node.Location(), err)
 	}
 
 	return b, nil

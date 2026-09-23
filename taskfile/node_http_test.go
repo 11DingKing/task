@@ -9,8 +9,10 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -281,4 +283,184 @@ func generateTestCACert(t *testing.T) []byte {
 		Type:  "CERTIFICATE",
 		Bytes: certDER,
 	})
+}
+
+func TestWriteFileAtomic(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cache.yaml")
+
+	require.NoError(t, writeFileAtomic(path, []byte("version: '3'\n")))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "version: '3'\n", string(got))
+
+	// A second write publishes new contents wholesale, so readers never see a
+	// partially rewritten file.
+	require.NoError(t, writeFileAtomic(path, []byte("version: '3'\ntasks: {}\n")))
+	got, err = os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "version: '3'\ntasks: {}\n", string(got))
+
+	// Staging files are removed once the write has been published.
+	matches, err := filepath.Glob(filepath.Join(dir, ".task-cache-*"))
+	require.NoError(t, err)
+	assert.Empty(t, matches)
+
+	// A failed write reports the error without leaving a staging file behind.
+	err = writeFileAtomic(filepath.Join(dir, "missing", "cache.yaml"), []byte("x"))
+	require.Error(t, err)
+	matches, err = filepath.Glob(filepath.Join(dir, "*", ".task-cache-*"))
+	require.NoError(t, err)
+	assert.Empty(t, matches)
+}
+
+func TestCacheNodeCommit(t *testing.T) {
+	t.Parallel()
+
+	node, err := NewHTTPNode("https://example.com/dir/Taskfile.yml", "", false)
+	require.NoError(t, err)
+
+	cacheDir := t.TempDir()
+	cache := NewCacheNode(node, cacheDir)
+
+	data := []byte("version: '3'\n")
+	sum := checksum(data)
+	now := time.Now().UTC().Truncate(time.Second)
+
+	require.NoError(t, cache.Commit(data, sum, now))
+
+	got, err := cache.Read()
+	require.NoError(t, err)
+	assert.Equal(t, data, got)
+	assert.Equal(t, sum, cache.ReadChecksum())
+	assert.Equal(t, now, cache.ReadTimestamp())
+
+	// Re-committing replaces all three artifacts as one unit.
+	data2 := []byte("version: '3'\ntasks: {}\n")
+	sum2 := checksum(data2)
+	require.NoError(t, cache.Commit(data2, sum2, now.Add(time.Minute)))
+
+	got, err = cache.Read()
+	require.NoError(t, err)
+	assert.Equal(t, data2, got)
+	assert.Equal(t, sum2, cache.ReadChecksum())
+	assert.Equal(t, now.Add(time.Minute), cache.ReadTimestamp())
+
+	matches, err := filepath.Glob(filepath.Join(cacheDir, remoteCacheDir, ".task-cache-*"))
+	require.NoError(t, err)
+	assert.Empty(t, matches, "no staging files should remain after commit")
+}
+
+// TestRemoteReadCommitBoundary makes sure that an abnormal response status and
+// an interrupted body read both fail without committing anything to the cache,
+// while a following retry issues a fresh request and commits the complete
+// response, which subsequent (including offline) runs then reuse.
+func TestRemoteReadCommitBoundary(t *testing.T) {
+	const want = "version: '3'\n"
+
+	tests := []struct {
+		name  string
+		abort func(t *testing.T, w http.ResponseWriter)
+	}{
+		{
+			name: "abnormal status",
+			abort: func(_ *testing.T, w http.ResponseWriter) {
+				w.WriteHeader(http.StatusInternalServerError)
+			},
+		},
+		{
+			name: "interrupted read",
+			abort: func(t *testing.T, w http.ResponseWriter) {
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					t.Error("test server does not support hijacking")
+					return
+				}
+				conn, bufrw, err := hj.Hijack()
+				if err != nil {
+					t.Errorf("hijack failed: %v", err)
+					return
+				}
+				defer conn.Close()
+				// Promise a larger body than is sent, then drop the connection
+				// so the client's read is interrupted.
+				_, _ = bufrw.WriteString("HTTP/1.1 200 OK\r\n" +
+					"Content-Type: text/yaml\r\n" +
+					"Content-Length: 1000\r\n" +
+					"Connection: close\r\n\r\n" +
+					"partial")
+				_ = bufrw.Flush()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gets atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/yaml")
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if gets.Add(1) == 1 {
+					tt.abort(t, w)
+					return
+				}
+				_, _ = w.Write([]byte(want))
+			}))
+			defer srv.Close()
+
+			node, err := NewHTTPNode(srv.URL+"/Taskfile.yml", "", true)
+			require.NoError(t, err)
+
+			cacheDir := t.TempDir()
+			cache := NewCacheNode(node, cacheDir)
+			newReader := func(offline bool) *Reader {
+				opts := []ReaderOption{
+					WithTempDir(cacheDir),
+					WithCacheExpiryDuration(time.Hour),
+				}
+				if offline {
+					opts = append(opts, WithOffline(true))
+				}
+				return NewReader(opts...)
+			}
+
+			// First attempt fails: the error returns without committing
+			// anything, so no partial content is observable at the cache path.
+			_, err = newReader(false).readRemoteNodeContent(t.Context(), node)
+			require.Error(t, err)
+
+			_, err = cache.Read()
+			require.ErrorIs(t, err, os.ErrNotExist)
+			matches, err := filepath.Glob(filepath.Join(cacheDir, remoteCacheDir, ".task-cache-*"))
+			require.NoError(t, err)
+			assert.Empty(t, matches)
+
+			// The retry makes a fresh request and only the complete response is
+			// committed.
+			b, err := newReader(false).readRemoteNodeContent(t.Context(), node)
+			require.NoError(t, err)
+			assert.Equal(t, want, string(b))
+			assert.Equal(t, int32(2), gets.Load())
+
+			cached, err := cache.Read()
+			require.NoError(t, err)
+			assert.Equal(t, want, string(cached))
+
+			// A fresh cache is served without issuing another request...
+			b, err = newReader(false).readRemoteNodeContent(t.Context(), node)
+			require.NoError(t, err)
+			assert.Equal(t, want, string(b))
+			assert.Equal(t, int32(2), gets.Load(), "the committed cache must be reused without re-requesting")
+
+			// ...and the same committed cache backs offline runs.
+			b, err = newReader(true).readRemoteNodeContent(t.Context(), node)
+			require.NoError(t, err)
+			assert.Equal(t, want, string(b))
+		})
+	}
 }

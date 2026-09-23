@@ -73,6 +73,11 @@ func RemoteExists(ctx context.Context, u url.URL, client *http.Client) (*url.URL
 		return nil, errors.TaskfileFetchFailedError{URI: u.Redacted(), HTTPStatusCode: resp.StatusCode}
 	}
 
+	// The first response is no longer needed from here on. Close it before
+	// probing alternative names instead of holding the connection open until
+	// the function returns.
+	_ = resp.Body.Close()
+
 	// If the request was not successful, append the default Taskfile names to
 	// the URL and return the URL of the first successful request
 	for _, taskfile := range DefaultTaskfiles {
@@ -85,16 +90,18 @@ func RemoteExists(ctx context.Context, u url.URL, client *http.Client) (*url.URL
 		req.URL = alt
 
 		// Try the alternative URL
-		resp, err = client.Do(req)
+		altResp, err := client.Do(req)
 		if err != nil {
 			return nil, errors.TaskfileFetchFailedError{URI: u.Redacted()}
 		}
-		defer resp.Body.Close()
-
-		// If the request was successful, return the URL
-		if resp.StatusCode == http.StatusOK {
-			return alt, nil
+		// Finalise each probe immediately: an abnormal status must not leave
+		// this connection open while the remaining names are tried.
+		if altResp.StatusCode != http.StatusOK {
+			_ = altResp.Body.Close()
+			continue
 		}
+		_ = altResp.Body.Close()
+		return alt, nil
 	}
 
 	return nil, errors.TaskfileNotFoundError{URI: u.Redacted(), Walk: false}

@@ -576,19 +576,14 @@ func (r *Reader) readRemoteNodeContent(ctx context.Context, node RemoteNode) ([]
 		}
 	}
 
-	// Store the checksum
-	if err := cache.WriteChecksum(checksum); err != nil {
-		return nil, err
-	}
-
-	// Store the timestamp
-	if err := cache.WriteTimestamp(now); err != nil {
-		return nil, err
-	}
-
-	// Cache the file
+	// Publish the complete download to the cache behind one commit boundary.
+	// The whole response was read and its checksum verified above, so only now
+	// are the content, checksum and timestamp staged and atomically moved into
+	// place (the timestamp is the freshness marker and is written last). A
+	// failure leaves any previous cache intact and commits nothing partial, so
+	// the next run re-requests the remote file rather than reusing a fragment.
 	r.debugf("caching %q to %q\n", node.Location(), cache.Location())
-	if err = cache.Write(downloadedBytes); err != nil {
+	if err := cache.Commit(downloadedBytes, checksum, now); err != nil {
 		return nil, err
 	}
 
